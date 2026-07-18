@@ -20,6 +20,14 @@ two independent signal types on every new tick:
     3. **Session awareness** — adjusts risk, confidence, and regime
        preference by time of day.
 
+**Trailing stops & adaptive tuning (Phase 2.2)**
+    When enough winning trades have accumulated:
+
+    - Trailing stop parameters can be applied to open positions.
+    - Strategy parameters (std-dev threshold, confidence, risk %) drift
+      toward what's produced winning trades via an EMA.
+    - Position sizing scales with signal confidence.
+
 The engine also enforces a per-symbol cooldown to avoid overtrading
 and discards signals whose spread exceeds the configured limit.
 """
@@ -31,6 +39,7 @@ from collections import deque
 from typing import Optional
 
 from src.client.models import Account, Quote
+from src.strategy.adaptive_tuning import AdaptiveState, get_adapted_params
 from src.strategy.indicators import (
     compute_micro_price,
     compute_std_dev,
@@ -48,6 +57,7 @@ from src.strategy.session import (
 )
 from src.strategy.signals import MarketSnapshot, Signal
 from src.strategy.sizing import StrategyConfig, calculate_position_size
+from src.strategy.trailing import TrailingConfig
 from src.strategy.volatility import (
     compute_atr,
     compute_volatility_ratio,
@@ -92,6 +102,10 @@ class StrategyEngine:
         # Cached latest regime for external inspection.
         self._last_regime: MarketRegime | None = None
         self._last_regime_confidence: float = 0.0
+        # Phase 2.2: trailing stop configuration.
+        self.trailing_config: TrailingConfig = TrailingConfig()
+        # Phase 2.2: adaptive parameter tuning state.
+        self.adaptive_state: AdaptiveState = AdaptiveState()
 
     # ------------------------------------------------------------------
     # Data ingestion
@@ -172,6 +186,22 @@ class StrategyEngine:
         session_min_confidence = session_params["min_confidence"]
         prefer_regime = session_params.get("prefer_regime")
 
+        # ---- 0d. Adaptive parameter tuning (Phase 2.2) --------------------
+        adapted_std_dev = self.config.mean_reversion_std_dev
+        adapted_min_confidence = self.config.min_confidence_threshold
+        adapted_risk_pct = self.config.risk_per_trade_pct
+
+        if self.adaptive_state.winning_trades >= 10:
+            defaults = {
+                "mean_reversion_std_dev": self.config.mean_reversion_std_dev,
+                "min_confidence_threshold": self.config.min_confidence_threshold,
+                "risk_per_trade_pct": self.config.risk_per_trade_pct,
+            }
+            adapted = get_adapted_params(self.adaptive_state, defaults)
+            adapted_std_dev = float(adapted.get("mean_reversion_std_dev", defaults["mean_reversion_std_dev"]))
+            adapted_min_confidence = float(adapted.get("min_confidence_threshold", defaults["min_confidence_threshold"]))
+            adapted_risk_pct = float(adapted.get("risk_per_trade_pct", defaults["risk_per_trade_pct"]))
+
         # ---- Per-symbol evaluation ---------------------------------------
         for symbol in self.symbols:
             buf = self._quote_buffers.get(symbol)
@@ -216,7 +246,7 @@ class StrategyEngine:
             # ---- Mean-reversion signal ------------------------------------
             mr_direction: str = "flat"
             mr_confidence: float = 0.0
-            threshold = self.config.mean_reversion_std_dev
+            threshold = adapted_std_dev
 
             if deviation > threshold:
                 # Price is stretched above VWAP → bet on reversal (short).
@@ -305,7 +335,7 @@ class StrategyEngine:
 
             # ---- Session confidence threshold (overrides config) ----------
             effective_min_confidence = max(
-                self.config.min_confidence_threshold,
+                adapted_min_confidence,
                 session_min_confidence,
             )
 
@@ -417,11 +447,41 @@ class StrategyEngine:
             current_positions=positions,
             config=self.config,
             instrument_limits=instrument_limits,
+            signal_confidence=signal.confidence,
         )
 
     # ------------------------------------------------------------------
     # Maintenance
     # ------------------------------------------------------------------
+
+    def record_trade_result(self, result: dict) -> None:
+        """Feed a completed trade result into adaptive tuning.
+
+        The orchestrator should call this after every round-trip trade so
+        the adaptive state can learn which parameters produce wins.
+
+        Args:
+            result: Dict with keys matching :meth:`AdaptiveState.update`.
+        """
+        self.adaptive_state.update(result)
+
+    @property
+    def last_adapted_params(self) -> dict | None:
+        """Current adapted parameters, or ``None`` if not enough data.
+
+        Returns a dict with keys ``mean_reversion_std_dev``,
+        ``min_confidence_threshold``, ``risk_per_trade_pct`` — or
+        ``None`` when fewer than 10 winning trades have been recorded.
+        """
+        if self.adaptive_state.winning_trades < 10:
+            return None
+
+        defaults = {
+            "mean_reversion_std_dev": self.config.mean_reversion_std_dev,
+            "min_confidence_threshold": self.config.min_confidence_threshold,
+            "risk_per_trade_pct": self.config.risk_per_trade_pct,
+        }
+        return get_adapted_params(self.adaptive_state, defaults)
 
     def clear_buffers(self) -> None:
         """Flush all quote buffers (e.g. after disconnect/reconnect).

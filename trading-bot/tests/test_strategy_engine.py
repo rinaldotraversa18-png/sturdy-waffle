@@ -867,9 +867,11 @@ class TestStrategyEngine:
         )
         # risk_budget = min(1250*0.25, 300) = 300
         # stop_distance_$ = 100 * 0.10 = 10
-        # contracts = floor(300/10) = 30
+        # raw_contracts = floor(300/10) = 30
+        # confidence_scalar = 0.5 + (0.8 * 0.5) = 0.9
+        # contracts = floor(30 * 0.9) = 27
         # MBT starts with M → micro → limit 40
-        assert size == 30
+        assert size == 27
 
     @pytest.mark.asyncio
     async def test_multiple_symbols_evaluated(self) -> None:

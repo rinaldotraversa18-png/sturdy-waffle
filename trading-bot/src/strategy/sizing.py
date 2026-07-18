@@ -96,6 +96,7 @@ def calculate_position_size(
     current_positions: list[Position],
     config: StrategyConfig,
     instrument_limits: dict[str, InstrumentLimit],
+    signal_confidence: float | None = None,
 ) -> int:
     """Risk-based position sizing for a single trade signal.
 
@@ -108,8 +109,11 @@ def calculate_position_size(
        ``stop_distance_$ = |entry − stop| × point_value``.
     3. Compute raw contracts:
        ``contracts = floor(risk_budget / stop_distance_$)``.
-    4. Cap at ``instrument_max − |current_position|``.
-    5. Return at least 1 if the risk budget allows, otherwise 0.
+    4. Apply confidence scaling (if provided):
+       ``confidence_scalar = 0.5 + (signal_confidence × 0.5)`` → range 0.5–1.0.
+       Contracts are multiplied by this scalar and floored.
+    5. Cap at ``instrument_max − |current_position|``.
+    6. Return at least 1 if the risk budget allows, otherwise 0.
 
     Args:
         signal: The trade signal (must have a non-``None`` stop_price
@@ -119,6 +123,8 @@ def calculate_position_size(
         current_positions: All open positions.
         config: Strategy parameters.
         instrument_limits: Per-symbol contract caps.
+        signal_confidence: Optional 0.0–1.0 score that scales position
+            size linearly.  0.6 → 0.8×, 0.9 → 0.95×, 1.0 → 1.0×.
 
     Returns:
         Number of contracts to trade (positive integer), or 0 to skip.
@@ -149,6 +155,18 @@ def calculate_position_size(
 
     # ---- 3. Raw contracts -------------------------------------------------
     raw_contracts = int(risk_per_trade_dollars / stop_distance_dollars)
+    if raw_contracts < 1:
+        return 0
+
+    # ---- 3b. Confidence-based scaling (NEW) --------------------------------
+    if signal_confidence is not None:
+        confidence_scalar = 0.5 + (signal_confidence * 0.5)
+        # Clamp to [0.0, 1.0] for safety.
+        confidence_scalar = max(0.0, min(1.0, confidence_scalar))
+        raw_contracts = int(math.floor(raw_contracts * confidence_scalar))
+        if raw_contracts < 1:
+            raw_contracts = 0
+
     if raw_contracts < 1:
         return 0
 
