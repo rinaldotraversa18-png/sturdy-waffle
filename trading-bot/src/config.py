@@ -10,6 +10,9 @@ from __future__ import annotations
 from pydantic import Field, computed_field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# Re-export StrategyConfig from the strategy module.
+from src.strategy.sizing import StrategyConfig  # noqa: F401, E402
+
 
 class TradovateConfig(BaseSettings):
     """Configuration for the Tradovate API client.
