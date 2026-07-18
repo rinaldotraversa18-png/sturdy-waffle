@@ -11,9 +11,15 @@ from src.client.models import (
     Position,
     Quote,
 )
+from src.client.ws_manager import (
+    AuthenticationError,
+    WebSocketManager,
+    WebSocketTimeoutError,
+)
 
 __all__ = [
     "Account",
+    "AuthenticationError",
     "BracketConfig",
     "BracketOrderRequest",
     "BracketOrderResponse",
@@ -23,4 +29,6 @@ __all__ = [
     "OrderResponse",
     "Position",
     "Quote",
+    "WebSocketManager",
+    "WebSocketTimeoutError",
 ]
