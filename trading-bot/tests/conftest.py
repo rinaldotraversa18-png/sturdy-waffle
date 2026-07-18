@@ -324,6 +324,12 @@ class MockTradovateClient:
     async def place_bracket(self, bracket: BracketOrderRequest) -> BracketOrderResponse:
         return self._place_bracket_return
 
+    async def cancel_order(self, order_id: int) -> None:
+        pass
+
+    async def modify_order(self, order_id: int, changes: dict) -> None:
+        pass
+
     # -- Callbacks -----------------------------------------------------------
 
     def on_account_update(self, cb) -> None:

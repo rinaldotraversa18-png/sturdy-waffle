@@ -36,6 +36,12 @@ from src.risk.limits import RiskConfig
 from src.risk.state import RiskState, StateManager
 from src.strategy.engine import StrategyEngine
 from src.strategy.sizing import StrategyConfig
+from src.strategy.trailing import (
+    TrailingConfig,
+    compute_trail_stop,
+    should_activate_trail,
+    should_update_trail,
+)
 from src.utils.clock import is_market_open, seconds_until_maintenance
 
 logger = structlog.get_logger(__name__)
@@ -117,6 +123,15 @@ class BotOrchestrator:
         self._result_reason: str = ""
         self._lock_fd: Optional[int] = None
 
+        # -- Phase 2: Adaptive feature state -----------------------------------
+        self._iteration_count: int = 0
+        # Track bracket orders: entry_order_id → {entry_price, symbol, direction, ...}
+        self._active_brackets: dict[int, dict] = {}
+        # Track active trailing stops: symbol → {direction, entry_price, stop_order_id, current_stop, target_price}
+        self._trailing_stops: dict[str, dict] = {}
+        # Track last-known position P&L baseline for win/loss detection.
+        self._last_position_pnl: dict[str, float] = {}
+
     # ------------------------------------------------------------------
     # run() — entry point
     # ------------------------------------------------------------------
@@ -175,6 +190,26 @@ class BotOrchestrator:
         # ---- Strategy engine --------------------------------------------------
         strat_config = StrategyConfig(symbols=self.config.symbols)
         self.strategy = StrategyEngine(strat_config)
+
+        # ---- Phase 2: Wire adaptive configs into strategy engine --------------
+        if self.config.adaptive_enabled:
+            from src.strategy.trailing import TrailingConfig as StratTrailingConfig
+            from src.strategy.adaptive_tuning import AdaptiveState
+
+            # Override trailing config with values from bot config.
+            self.strategy.trailing_config = StratTrailingConfig(
+                activation_pct=self.config.trailing.activation_pct,
+                trail_distance_ticks=self.config.trailing.trail_distance_ticks,
+                step_ticks=self.config.trailing.step_ticks,
+            )
+            # AdaptiveState uses module-level constants; update them from config.
+            self.strategy.adaptive_state._alpha = self.config.adaptive.ema_alpha
+            logger.info(
+                "orchestrator.adaptive_wired",
+                trailing_activation_pct=self.config.trailing.activation_pct,
+                adaptive_alpha=self.config.adaptive.ema_alpha,
+                min_wins_to_adapt=self.config.adaptive.min_wins_to_adapt,
+            )
 
         # ---- State manager ----------------------------------------------------
         self.state_manager = StateManager(file_path=self.config.state_path)
@@ -277,7 +312,9 @@ class BotOrchestrator:
 
             # ---- 4. Generate signals -----------------------------------------
             try:
-                signals = await self.strategy.generate_signals()
+                signals = await self.strategy.generate_signals(
+                    account=self._latest_account,
+                )
             except Exception:
                 logger.exception("orchestrator.signal_error")
                 await asyncio.sleep(self.config.loop_interval)
@@ -343,13 +380,39 @@ class BotOrchestrator:
                         entry_order_id=response.entry_order_id,
                         status=response.status,
                     )
+                    # Track bracket for trade-result recording.
+                    self._active_brackets[response.entry_order_id] = {
+                        "symbol": sig.symbol,
+                        "direction": sig.direction,
+                        "entry_price": sig.entry_price,
+                        "target_price": sig.target_price,
+                        "stop_price": sig.stop_price,
+                        "confidence": sig.confidence,
+                        "contracts": contracts,
+                        "stop_loss_order_id": response.stop_loss_order_id,
+                        "profit_target_order_id": response.profit_target_order_id,
+                    }
                 except Exception:
                     logger.exception(
                         "orchestrator.order_failed",
                         symbol=sig.symbol,
                     )
 
-            # ---- 6. Sleep ----------------------------------------------------
+            # ---- 6. Adaptive logging (every 10 iterations) -------------------
+            self._iteration_count += 1
+            if self._iteration_count % 10 == 0 and self.config.adaptive_enabled:
+                adapted = self.strategy.last_adapted_params
+                if adapted is not None:
+                    logger.info(
+                        "orchestrator.adaptive_params",
+                        iteration=self._iteration_count,
+                        winning_trades=self.strategy.adaptive_state.winning_trades,
+                        mean_reversion_std_dev=adapted.get("mean_reversion_std_dev"),
+                        min_confidence_threshold=adapted.get("min_confidence_threshold"),
+                        risk_per_trade_pct=adapted.get("risk_per_trade_pct"),
+                    )
+
+            # ---- 7. Sleep ----------------------------------------------------
             await asyncio.sleep(self.config.loop_interval)
 
     # ------------------------------------------------------------------
@@ -372,12 +435,9 @@ class BotOrchestrator:
         )
 
     async def _on_order_update(self, order: Order) -> None:
-        """Route order updates — track fills for trade stats."""
+        """Route order updates — track fills for trade stats and adaptive tuning."""
         if order.order_status == "Filled" and order.filled_qty > 0:
             self._trades += 1
-            # We can't determine P&L purely from a fill — that needs a
-            # round-trip.  For now, track win/loss from risk engine state
-            # when we can infer from realised P&L changes.
             logger.info(
                 "callback.fill",
                 order_id=order.id,
@@ -386,6 +446,73 @@ class BotOrchestrator:
                 filled_qty=order.filled_qty,
                 avg_fill_price=order.avg_fill_price,
             )
+
+            # -- Phase 2: Trade-close detection for adaptive tuning -------------
+            if self.config.adaptive_enabled and self.strategy is not None:
+                # Check if this fill closes a bracket leg (stop-loss or TP).
+                for entry_id, bracket_info in list(self._active_brackets.items()):
+                    if order.id in (
+                        bracket_info.get("stop_loss_order_id"),
+                        bracket_info.get("profit_target_order_id"),
+                    ):
+                        # Trade closed — compute result and feed adaptive.
+                        entry_price = bracket_info.get("entry_price", 0.0)
+                        fill_price = order.avg_fill_price or 0.0
+                        direction = bracket_info.get("direction", "flat")
+                        pnl: float = 0.0
+                        if direction == "long":
+                            pnl = (fill_price - entry_price) * bracket_info.get("contracts", 0)
+                        elif direction == "short":
+                            pnl = (entry_price - fill_price) * bracket_info.get("contracts", 0)
+
+                        was_winner = pnl > 0
+                        if was_winner:
+                            self._winning += 1
+                        else:
+                            self._losing += 1
+
+                        self.strategy.record_trade_result({
+                            "was_winner": was_winner,
+                            "signal_std_dev": 2.0,  # default; can be enriched later
+                            "signal_confidence": bracket_info.get("confidence", 0.6),
+                            "risk_pct": self.strategy.config.risk_per_trade_pct,
+                            "pnl": pnl,
+                        })
+
+                        logger.info(
+                            "orchestrator.trade_closed",
+                            symbol=bracket_info.get("symbol"),
+                            direction=direction,
+                            pnl=pnl,
+                            was_winner=was_winner,
+                        )
+
+                        # Clean up bracket tracking and trailing stop.
+                        self._active_brackets.pop(entry_id, None)
+                        symbol = bracket_info.get("symbol", "")
+                        self._trailing_stops.pop(symbol, None)
+                        break
+
+            # -- Phase 2: Entry fill → start trailing stop tracking -------------
+            if self.config.adaptive_enabled and self.config.trailing.enabled:
+                for entry_id, bracket_info in list(self._active_brackets.items()):
+                    if order.id == entry_id and order.avg_fill_price:
+                        # Entry filled — start tracking for trailing stop.
+                        symbol = bracket_info.get("symbol", "")
+                        self._trailing_stops[symbol] = {
+                            "direction": bracket_info.get("direction", "flat"),
+                            "entry_price": order.avg_fill_price,
+                            "stop_order_id": bracket_info.get("stop_loss_order_id"),
+                            "current_stop": bracket_info.get("stop_price", 0.0),
+                            "target_price": bracket_info.get("target_price", 0.0),
+                        }
+                        logger.info(
+                            "orchestrator.trailing_armed",
+                            symbol=symbol,
+                            entry_price=order.avg_fill_price,
+                            initial_stop=bracket_info.get("stop_price"),
+                        )
+                        break
 
         # If this fill carries P&L info (some brokers embed it), feed
         # it to the risk engine.  For Tradovate, fills don't directly
@@ -397,10 +524,66 @@ class BotOrchestrator:
             pass
 
     async def _on_quote(self, quote: Quote) -> None:
-        """Route real-time quotes → strategy engine."""
+        """Route real-time quotes → strategy engine and trailing stop logic."""
         if self.strategy is None:
             return
         self.strategy.ingest_quote(quote)
+
+        # -- Phase 2: Trailing stop check ---------------------------------------
+        if not self.config.adaptive_enabled or not self.config.trailing.enabled:
+            return
+        if self.client is None:
+            return
+
+        trail_info = self._trailing_stops.get(quote.symbol)
+        if trail_info is None:
+            return
+
+        direction = trail_info["direction"]
+        entry_price = trail_info["entry_price"]
+        target_price = trail_info["target_price"]
+        current_stop = trail_info["current_stop"]
+        stop_order_id = trail_info.get("stop_order_id")
+
+        if direction not in ("long", "short") or stop_order_id is None:
+            return
+
+        # Use bid for longs, ask for shorts as the reference price.
+        current_price = quote.bid if direction == "long" else quote.ask
+
+        # Build a TrailingConfig from the bot config.
+        trail_cfg = TrailingConfig(
+            activation_pct=self.config.trailing.activation_pct,
+            trail_distance_ticks=self.config.trailing.trail_distance_ticks,
+            step_ticks=self.config.trailing.step_ticks,
+        )
+        tick_size = 0.50  # default for MBT; could be from instrument config
+
+        if not should_activate_trail(entry_price, current_price, target_price, trail_cfg):
+            return
+
+        new_stop = compute_trail_stop(current_price, direction, trail_cfg.trail_distance_ticks, tick_size)
+
+        if not should_update_trail(current_stop, new_stop, direction, trail_cfg.step_ticks, tick_size):
+            return
+
+        # Modify the stop order.
+        try:
+            await self.client.modify_order(stop_order_id, {"stopPrice": new_stop})
+            trail_info["current_stop"] = new_stop
+            logger.debug(
+                "orchestrator.trail_updated",
+                symbol=quote.symbol,
+                direction=direction,
+                old_stop=current_stop,
+                new_stop=new_stop,
+            )
+        except Exception:
+            logger.exception(
+                "orchestrator.trail_failed",
+                symbol=quote.symbol,
+                stop_order_id=stop_order_id,
+            )
 
     # ------------------------------------------------------------------
     # End-condition evaluation

@@ -113,3 +113,121 @@ class BotConfig(PydanticBaseModel):
         default=True,
         description="Track winning/losing trade counts",
     )
+
+    # -- Adaptive features ----------------------------------------------------
+    adaptive_enabled: bool = Field(
+        default=True,
+        description="Enable all Phase 2 adaptive features",
+    )
+
+    # -- Adaptive sub-configs (loaded from config.yaml) ------------------------
+    adaptive: AdaptiveConfig = Field(
+        default_factory=lambda: AdaptiveConfig(),
+        description="Adaptive parameter tuning configuration",
+    )
+    trailing: TrailingStopConfig = Field(
+        default_factory=lambda: TrailingStopConfig(),
+        description="Trailing stop configuration",
+    )
+    regime: RegimeConfig = Field(
+        default_factory=lambda: RegimeConfig(),
+        description="Market regime detection configuration",
+    )
+    volatility: VolatilityConfig = Field(
+        default_factory=lambda: VolatilityConfig(),
+        description="Volatility filter configuration",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: Adaptive feature configuration models
+# ---------------------------------------------------------------------------
+
+
+class AdaptiveConfig(PydanticBaseModel):
+    """Configuration for adaptive parameter tuning (Phase 2)."""
+
+    enabled: bool = Field(
+        default=True,
+        description="Enable adaptive parameter tuning",
+    )
+    min_wins_to_adapt: int = Field(
+        default=10,
+        ge=1,
+        description="Minimum winning trades before adapted params are used",
+    )
+    ema_alpha: float = Field(
+        default=0.15,
+        ge=0.0,
+        le=1.0,
+        description="EMA smoothing factor for parameter drift",
+    )
+    param_drift_cap_pct: float = Field(
+        default=0.50,
+        ge=0.0,
+        le=1.0,
+        description="Maximum drift from defaults (±50% = 0.50)",
+    )
+
+
+class TrailingStopConfig(PydanticBaseModel):
+    """Configuration for trailing stop management (Phase 2)."""
+
+    enabled: bool = Field(
+        default=True,
+        description="Enable trailing stops",
+    )
+    activation_pct: float = Field(
+        default=0.30,
+        ge=0.0,
+        le=1.0,
+        description="Start trailing after N% toward target",
+    )
+    trail_distance_ticks: int = Field(
+        default=20,
+        ge=1,
+        description="Stop lag behind current price in ticks",
+    )
+    step_ticks: int = Field(
+        default=5,
+        ge=1,
+        description="Minimum tick movement to adjust stop",
+    )
+
+
+class RegimeConfig(PydanticBaseModel):
+    """Configuration for market regime detection (Phase 2)."""
+
+    trending_efficiency: float = Field(
+        default=0.40,
+        ge=0.0,
+        le=1.0,
+        description="Efficiency ratio above this = trending",
+    )
+    ranging_efficiency: float = Field(
+        default=0.20,
+        ge=0.0,
+        le=1.0,
+        description="Efficiency ratio below trending, above this = ranging",
+    )
+    choppy_efficiency: float = Field(
+        default=0.20,
+        ge=0.0,
+        le=1.0,
+        description="Efficiency ratio below this = choppy (block trading)",
+    )
+
+
+class VolatilityConfig(PydanticBaseModel):
+    """Configuration for volatility filter (Phase 2)."""
+
+    max_ratio: float = Field(
+        default=1.50,
+        gt=0.0,
+        description="Current/median ATR ratio max",
+    )
+    atr_period: int = Field(
+        default=14,
+        ge=2,
+        description="ATR calculation window",
+    )

@@ -73,6 +73,18 @@ Examples:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Log level (default: INFO)",
     )
+    parser.add_argument(
+        "--adaptive",
+        action="store_true",
+        default=True,
+        help="Enable all adaptive features (default)",
+    )
+    parser.add_argument(
+        "--no-adaptive",
+        action="store_true",
+        default=False,
+        help="Disable all Phase 2 adaptive features",
+    )
     return parser.parse_args(argv)
 
 
@@ -102,11 +114,27 @@ class Config:
         try:
             import yaml
 
+            from src.config import AdaptiveConfig, RegimeConfig, TrailingStopConfig, VolatilityConfig
+
             with open(path, "r") as f:
                 raw = yaml.safe_load(f) or {}
-            return BotConfig(**raw.get("bot", {}))
+            bot_raw = raw.get("bot", {})
+            strategy_raw = raw.get("strategy", {})
+
+            # Build BotConfig with sub-configs from strategy section.
+            adaptive_raw = strategy_raw.get("adaptive", {})
+            trailing_raw = strategy_raw.get("trailing", {})
+            regime_raw = strategy_raw.get("regime", {})
+            volatility_raw = strategy_raw.get("volatility", {})
+
+            return BotConfig(
+                **bot_raw,
+                adaptive=AdaptiveConfig(**adaptive_raw) if adaptive_raw else AdaptiveConfig(),
+                trailing=TrailingStopConfig(**trailing_raw) if trailing_raw else TrailingStopConfig(),
+                regime=RegimeConfig(**regime_raw) if regime_raw else RegimeConfig(),
+                volatility=VolatilityConfig(**volatility_raw) if volatility_raw else VolatilityConfig(),
+            )
         except ImportError:
-            # PyYAML not installed — use defaults.
             logger.warning("config.no_yaml", path=path)
             return BotConfig()
         except FileNotFoundError:
@@ -139,6 +167,13 @@ async def main(argv: list[str] | None = None) -> int:
     config = Config.load(args.config)
     config.environment = args.env
     config.log_level = args.log_level
+
+    # Apply --no-adaptive flag.
+    if args.no_adaptive:
+        config.adaptive_enabled = False
+        config.adaptive.enabled = False
+        config.trailing.enabled = False
+        logger.info("adaptive.disabled", reason="--no-adaptive flag")
 
     # 2. Set up structured logging.
     setup_logging(level=config.log_level, log_dir=config.log_dir)
