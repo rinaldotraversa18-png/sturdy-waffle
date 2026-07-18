@@ -11,6 +11,7 @@ from src.client.models import (
     Position,
     Quote,
 )
+from src.client.tradovate_client import TradovateAuthError, TradovateClient
 from src.client.ws_manager import (
     AuthenticationError,
     WebSocketManager,
@@ -29,6 +30,8 @@ __all__ = [
     "OrderResponse",
     "Position",
     "Quote",
+    "TradovateAuthError",
+    "TradovateClient",
     "WebSocketManager",
     "WebSocketTimeoutError",
 ]
