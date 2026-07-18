@@ -1,0 +1,57 @@
+# ── Trading Bot Configuration ──────────────────────────────────────────
+# Default: Tradeify $50,000 Growth Funded Account evaluation.
+#
+# All paths are relative to the trading-bot/ directory.
+# Secrets (API keys, credentials) MUST be set via .env — never here.
+
+# ── Bot orchestrator ───────────────────────────────────────────────────
+bot:
+  loop_interval: 1.0         # seconds between main-loop ticks
+  state_path: "state.json"    # persisted evaluation state
+  lock_path: "bot.lock"       # PID lock to prevent double-runs
+  log_level: "INFO"           # DEBUG | INFO | WARNING | ERROR
+  log_dir: "logs"             # directory for structured JSON logs
+  environment: "demo"         # "demo" (paper) or "live"
+  symbols: ["MBT", "MET"]     # contracts to trade
+  track_trade_stats: true
+
+# ── Tradovate connection ───────────────────────────────────────────────
+# All secret values are loaded from environment variables (or .env).
+tradovate:
+  environment: "demo"
+  # TRADOVATE_USERNAME  — set in .env
+  # TRADOVATE_PASSWORD  — set in .env
+  # TRADOVATE_APP_ID    — set in .env
+  # TRADOVATE_DEVICE_ID — set in .env
+
+# ── Risk parameters ────────────────────────────────────────────────────
+risk:
+  profit_target: 3000.0      # $3,000 total realised P&L to pass
+  max_eod_drawdown: 2000.0   # $2,000 trailing drawdown floor
+  daily_loss_limit: 1250.0   # $1,250 daily realised loss cap
+  max_mini_contracts: 4      # hard cap on mini contracts
+  max_micro_contracts: 40    # hard cap on micro contracts
+  instrument_limits:
+    MBT:
+      max_contracts: 4
+      tick_value: 0.50
+    MET:
+      max_contracts: 4
+      tick_value: 0.025
+
+# ── Strategy parameters ────────────────────────────────────────────────
+strategy:
+  symbols: ["MBT", "MET"]
+  primary_symbol: "MBT"
+  risk_per_trade_pct: 0.25       # 25% of remaining daily loss
+  max_risk_per_trade: 300.0      # $300 hard cap per trade
+  mean_reversion_std_dev: 2.0    # N std from VWAP → reversal signal
+  breakout_consecutive_ticks: 5  # consecutive same-direction ticks
+  volume_spike_multiplier: 2.0   # volume vs rolling average ratio
+  quote_window_size: 200         # max quotes in rolling buffer
+  min_spread_bps: 5.0            # max allowed spread in bps
+  cooldown_seconds: 30.0         # min seconds between signals per symbol
+  min_confidence_threshold: 0.6  # minimum signal confidence to act
+  point_values:
+    MBT: 0.10    # 0.1 BTC × $1.00/point
+    MET: 0.10    # 0.1 ETH × $1.00/point
