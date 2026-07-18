@@ -12,6 +12,14 @@ two independent signal types on every new tick:
     When we see *N* consecutive ticks in the same direction *and* the
     latest tick carries unusually high volume, we bet on continuation.
 
+**Adaptive gating (Phase 2)**
+    Before generating signals, the engine consults three filters:
+
+    1. **Regime detection** — choppy markets suppress all signals.
+    2. **Volatility filter** — excessive ATR blocks trading.
+    3. **Session awareness** — adjusts risk, confidence, and regime
+       preference by time of day.
+
 The engine also enforces a per-symbol cooldown to avoid overtrading
 and discards signals whose spread exceeds the configured limit.
 """
@@ -22,7 +30,7 @@ import time
 from collections import deque
 from typing import Optional
 
-from src.client.models import Quote
+from src.client.models import Account, Quote
 from src.strategy.indicators import (
     compute_micro_price,
     compute_std_dev,
@@ -32,8 +40,19 @@ from src.strategy.indicators import (
     get_consecutive_direction_sign,
     is_spread_eligible,
 )
+from src.strategy.regime import MarketRegime, detect_regime
+from src.strategy.session import (
+    TradingSession,
+    get_current_session,
+    get_session_params,
+)
 from src.strategy.signals import MarketSnapshot, Signal
 from src.strategy.sizing import StrategyConfig, calculate_position_size
+from src.strategy.volatility import (
+    compute_atr,
+    compute_volatility_ratio,
+    is_safe_to_trade,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -47,7 +66,7 @@ class StrategyEngine:
 
         engine = StrategyEngine(StrategyConfig())
         engine.ingest_quote(quote)               # push every tick
-        signals = await engine.generate_signals()  # evaluate all symbols
+        signals = await engine.generate_signals(account)  # evaluate all symbols
         for sig in signals:
             if sig.confidence >= engine.config.min_confidence_threshold:
                 size = engine.calculate_size(sig, acct, risk, positions)
@@ -68,6 +87,11 @@ class StrategyEngine:
         self._last_signal_time: dict[str, float] = {
             sym: 0.0 for sym in self.symbols
         }
+        # Historical ATR values for volatility ratio computation.
+        self._historical_atr: deque[float] = deque(maxlen=50)
+        # Cached latest regime for external inspection.
+        self._last_regime: MarketRegime | None = None
+        self._last_regime_confidence: float = 0.0
 
     # ------------------------------------------------------------------
     # Data ingestion
@@ -86,11 +110,15 @@ class StrategyEngine:
     # Signal generation
     # ------------------------------------------------------------------
 
-    async def generate_signals(self) -> list[Signal]:
+    async def generate_signals(
+        self,
+        account: Account | None = None,
+    ) -> list[Signal]:
         """Evaluate all tracked symbols and return actionable signals.
 
         Each symbol is evaluated independently:
 
+        0. **Adaptive gates** (regime, volatility, session) run first.
         1. Skip if the buffer has fewer than 50 quotes.
         2. Skip if the spread is too wide (``min_spread_bps`` config).
         3. Compute VWAP, std-dev, micro-price, volume-spike flag.
@@ -100,12 +128,51 @@ class StrategyEngine:
         6. Combine confidences (higher when both agree).
         7. Enforce per-symbol cooldown.
 
+        Args:
+            account: Optional account snapshot for volatility safety
+                check.  When ``None``, the account-based volatility
+                gate is skipped.
+
         Returns:
             List of :class:`Signal` objects (may be empty).
         """
         signals: list[Signal] = []
         now = time.time()
 
+        # ---- 0a. Regime gate (symbol-agnostic) ---------------------------
+        # Use the first symbol's buffer for regime detection.
+        primary_buf = self._quote_buffers.get(self.symbols[0]) if self.symbols else None
+        if primary_buf is not None and len(primary_buf) >= 50:
+            regime, regime_conf = detect_regime(primary_buf)
+            self._last_regime = regime
+            self._last_regime_confidence = regime_conf
+            if regime == MarketRegime.CHOPPY:
+                return []
+
+        # ---- 0b. Volatility gate (symbol-agnostic) -----------------------
+        if primary_buf is not None and len(primary_buf) >= 15:
+            atr = compute_atr(primary_buf, period=14)
+            if atr > 0:
+                self._historical_atr.append(atr)
+                vol_ratio = compute_volatility_ratio(atr, self._historical_atr)
+                if account is not None:
+                    safe, reason = is_safe_to_trade(vol_ratio, atr, account)
+                    if not safe:
+                        return []
+
+        # ---- 0c. Session parameters --------------------------------------
+        session = get_current_session()
+        session_params = get_session_params(session)
+
+        # PRE_CLOSE → no trading.
+        if session == TradingSession.PRE_CLOSE:
+            return []
+
+        risk_mult = session_params["risk_multiplier"]
+        session_min_confidence = session_params["min_confidence"]
+        prefer_regime = session_params.get("prefer_regime")
+
+        # ---- Per-symbol evaluation ---------------------------------------
         for symbol in self.symbols:
             buf = self._quote_buffers.get(symbol)
             if buf is None or len(buf) < 50:
@@ -217,8 +284,32 @@ class StrategyEngine:
                     f"Breakout: {consecutive_dir:+d} consecutive ticks + volume spike"
                 )
 
-            # ---- Threshold gate -------------------------------------------
-            if final_confidence < self.config.min_confidence_threshold:
+            # ---- Adaptive confidence adjustment (Phase 2) -----------------
+            # Regime preference boost/penalty.
+            if prefer_regime is not None and self._last_regime is not None:
+                regime_value = self._last_regime.value
+                if regime_value == prefer_regime:
+                    # Boost confidence when regime matches session preference.
+                    final_confidence = min(1.0, final_confidence * 1.15)
+                    rationale_parts.append(
+                        f"Regime boost: {regime_value} matches "
+                        f"session preference ({prefer_regime})"
+                    )
+                else:
+                    # Penalize when regime conflicts with session preference.
+                    final_confidence = max(0.0, final_confidence * 0.75)
+                    rationale_parts.append(
+                        f"Regime penalty: {regime_value} conflicts with "
+                        f"session preference ({prefer_regime})"
+                    )
+
+            # ---- Session confidence threshold (overrides config) ----------
+            effective_min_confidence = max(
+                self.config.min_confidence_threshold,
+                session_min_confidence,
+            )
+
+            if final_confidence < effective_min_confidence:
                 continue
 
             # ---- Construct signal -----------------------------------------
@@ -226,6 +317,9 @@ class StrategyEngine:
             stop_offset = abs(deviation * std_dev) * 0.5  # half the deviation as stop
             if stop_offset <= 0:
                 stop_offset = std_dev  # fallback: 1 std-dev stop
+
+            # Apply session risk multiplier to stop distance.
+            stop_offset *= risk_mult
 
             if final_direction == "long":
                 stop_price = price - stop_offset
@@ -272,6 +366,16 @@ class StrategyEngine:
         # We don't store signal history; return None for now.
         # The orchestrator should call generate_signals() for fresh signals.
         return None
+
+    @property
+    def last_regime(self) -> MarketRegime | None:
+        """Cached regime from the most recent ``generate_signals()`` call."""
+        return self._last_regime
+
+    @property
+    def last_regime_confidence(self) -> float:
+        """Cached regime confidence from the most recent call."""
+        return self._last_regime_confidence
 
     # ------------------------------------------------------------------
     # Position sizing (delegated)
