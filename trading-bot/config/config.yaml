@@ -55,3 +55,28 @@ strategy:
   point_values:
     MBT: 0.10    # 0.1 BTC × $1.00/point
     MET: 0.10    # 0.1 ETH × $1.00/point
+
+  # Phase 2: Adaptive strategy
+  adaptive:
+    enabled: true
+    min_wins_to_adapt: 10
+    ema_alpha: 0.15
+    param_drift_cap_pct: 0.50    # ±50% max drift from default
+
+  # Phase 2: Trailing stops
+  trailing:
+    enabled: true
+    activation_pct: 0.30         # Start trailing after 30% toward target
+    trail_distance_ticks: 20     # Stop lag behind current price (ticks)
+    step_ticks: 5                # Minimum movement to adjust stop
+
+  # Phase 2: Market regime
+  regime:
+    trending_efficiency: 0.40    # Efficiency ratio > this = trending
+    ranging_efficiency: 0.20     # Below trending, above this = ranging
+    choppy_efficiency: 0.20      # Below this = choppy (block trading)
+
+  # Phase 2: Volatility filter
+  volatility:
+    max_ratio: 1.50              # Current/median ATR ratio max
+    atr_period: 14               # ATR calculation window
