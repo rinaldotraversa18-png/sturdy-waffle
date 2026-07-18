@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Environment
+.env
+
+# Logs
+logs/*.jsonl
+
+# State
+state.json
+bot.lock
+
+# IDE
+.vscode/
+.idea/
+
+# Distribution
+dist/
+build/
+*.egg-info/
