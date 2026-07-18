@@ -1,0 +1,24 @@
+# ── Instrument specifications ──────────────────────────────────────────
+# Per-contract metadata used by the risk engine and strategy for position
+# sizing, tick-value calculations, and contract-limit enforcement.
+#
+# MBT — CME Micro Bitcoin futures
+# MET — CME Micro Ether futures
+
+MBT:
+  description: "Micro Bitcoin futures"
+  exchange: "CME"
+  max_contracts: 4
+  tick_size: 5.0          # $5.00 per tick for 0.1 BTC
+  tick_value: 0.50        # $0.50 per tick per contract
+  point_value: 0.10       # $0.10 per 1-point move per contract
+  multiplier: 0.1         # 0.1 BTC per contract
+
+MET:
+  description: "Micro Ether futures"
+  exchange: "CME"
+  max_contracts: 4
+  tick_size: 0.25         # $0.25 per tick for 0.1 ETH
+  tick_value: 0.025       # $0.025 per tick per contract
+  point_value: 0.10       # $0.10 per 1-point move per contract
+  multiplier: 0.1         # 0.1 ETH per contract
